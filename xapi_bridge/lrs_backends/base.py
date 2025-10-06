@@ -64,3 +64,11 @@ class LRSBackendBase(ABC):
         Raises:
             XAPIBridgeLRSBackendResponseParseError: Ошибка парсинга ответа
         """
+
+    def is_not_found(self, status_code: int, response_data: Any) -> bool:
+        """Возвращает True, если ответ указывает на 404 Not Found.
+
+        По умолчанию проверяем только HTTP-статус.
+        Реализации могут переопределить метод для тонкой логики.
+        """
+        return status_code == 404

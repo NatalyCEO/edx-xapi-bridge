@@ -24,6 +24,7 @@ from pyinotify import WatchManager, Notifier, NotifierError, EventsCodes, Proces
 from tincan import StatementList
 
 from xapi_bridge import client, converter, exceptions, settings
+from xapi_bridge.retry_queue import RetryQueueWorker
 from xapi_bridge.constants import OPENEDX_OAUTH2_TOKEN_URL
 from xapi_bridge.historical_processor import process_historical_logs
 
@@ -106,6 +107,10 @@ class QueueManager:
                     self._handle_connection_error(e, statements)
                 except exceptions.XAPIBridgeStatementError as e:
                     self._handle_storage_error(e, statements)
+                except exceptions.XAPIBridgeDeferredRetry as e:
+                    # Пакет отложен, выходим из цикла без инкремента счетчика
+                    logger.warning(e.message)
+                    break
                 except Exception as e:
                     # Обработка всех остальных непредвиденных ошибок
                     logger.error(f"Произошла непредвиденная ошибка во время публикации высказываний: {e}")
@@ -135,6 +140,9 @@ class QueueManager:
         # Удаляем проблемное высказывание из списка
         if e.statement in statements:
             statements.remove(e.statement)
+        # Если это отложенная отправка — просто выходим из цикла, не считаем как отправленные
+        if isinstance(e, exceptions.XAPIBridgeDeferredRetry):
+            raise
 
 
 class NotifierLostINodeException(NotifierError):
@@ -394,6 +402,10 @@ def main():
     """Main entry point."""
     args = parse_args()
     setup_logging()
+
+    # Фоновый воркер для повторной отправки из очереди
+    retry_worker = RetryQueueWorker()
+    retry_worker.start()
 
     if args.historical_logs_dir:
         process_gzipped_logs(args.historical_logs_dir, args.historical_logs_dates)

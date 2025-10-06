@@ -7,8 +7,8 @@ import logging
 import os
 import time
 from typing import Any, Dict, Optional
-
 from sentry_sdk import capture_exception, capture_message, configure_scope
+
 
 
 logger = logging.getLogger(__name__)
@@ -150,3 +150,13 @@ class XAPIBridgeCriticalError(XAPIBridgeBaseException):
         logger.critical("Экстренное завершение работы")
         time.sleep(1)  # Даем время для отправки логов
         os._exit(os.EX_UNAVAILABLE)
+
+
+class XAPIBridgeDeferredRetry(XAPIBridgeBaseException):
+    """Отложенная повторная отправка (например, при 404 от LRS)."""
+
+    def __init__(self, reason: str, statements_count: int):
+        super().__init__(
+            message=f"Отложена повторная отправка {statements_count} высказываний: {reason}",
+            context={'reason': reason, 'statements_count': statements_count}
+        )

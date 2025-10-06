@@ -68,3 +68,7 @@ class LRSBackend(LRSBackendBase):
             return 'warnings' in data
         except json.JSONDecodeError:
             return False
+
+    def is_not_found(self, status_code: int, response_data: Any) -> bool:
+        # Для Learning Locker достаточно статуса 404
+        return status_code == 404

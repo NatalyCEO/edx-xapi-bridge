@@ -15,6 +15,7 @@ from tincan.lrs_response import LRSResponse
 import xapi_bridge.exceptions as exceptions
 from xapi_bridge import settings
 from xapi_bridge.lrs_backends.learninglocker import LRSBackend
+from xapi_bridge.retry_queue import RetryQueue
 
 
 logger = logging.getLogger(__name__)
@@ -26,6 +27,7 @@ class XAPIBridgeLRSPublisher:
     def __init__(self):
         self.lrs = self._configure_lrs()
         self.backend = LRSBackend()
+        self.retry_queue = RetryQueue()
 
     def _configure_lrs(self) -> RemoteLRS:
         """Конфигурация подключения к LRS."""
@@ -184,7 +186,24 @@ class XAPIBridgeLRSPublisher:
                 statement=bad_statement
             )
 
-        error_msg = (f"Неопознанная ошибка отправки в LRS: {response.response.status} -"
+        # Если 404 — откладываем на повтор
+        status_code = getattr(response.response, 'status', None)
+        if self.backend.is_not_found(status_code, response_data_str):
+            # сохраняем JSON контент запроса без повторной сериализации
+            content = response.request.content
+            if isinstance(content, (bytes, bytearray)):
+                content = content.decode('utf-8', errors='ignore')
+            try:
+                self.retry_queue.enqueue(content)
+            except Exception:
+                logger.exception("Не удалось добавить высказывания в очередь отложенной отправки")
+            # В любом случае сигнализируем об отложенной отправке, чтобы верхний уровень не считал как успех
+            raise exceptions.XAPIBridgeDeferredRetry(
+                reason=f"HTTP {status_code}",
+                statements_count=len(statements)
+            )
+
+        error_msg = (f"Неопознанная ошибка отправки в LRS: {status_code} -"
                     + f" {response_data_str}. Высказывания: {response.request.content}")
         logger.error(error_msg)
 

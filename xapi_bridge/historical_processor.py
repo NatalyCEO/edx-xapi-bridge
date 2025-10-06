@@ -135,6 +135,9 @@ def process_historical_logs(log_file, batch_size=100, test_mode=False, output_fi
                     
                     client.lrs_publisher.publish_statements(statement_list)
                     logger.info(f"Отправлено {len(batch)} утверждений в LRS.")
+                except exceptions.XAPIBridgeDeferredRetry as e:
+                    logger.warning(e.message)
+                    # продолжаем обработку следующих пакетов
                 except Exception as e:
                     logger.error(f"Ошибка при отправке пакета в LRS: {e}")
 
