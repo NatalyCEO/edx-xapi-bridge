@@ -11,6 +11,13 @@ volumes:
         type: ext4
         device: "/mnt/old_logs"
         o: bind
+  retry_logs:
+    driver: local
+    driver_opts:
+        type: ext4
+        device: "/var/log/logs_for_xapi_retry"
+        o: bind
+  
 
 services:
   xapi_bridge:
@@ -28,6 +35,7 @@ services:
     volumes:
       - tracking_logs:/var/log
       - old_logs:/var/old_logs
+      - retry_logs:/var/retry
     develop:
       watch:
         - action: sync+restart
