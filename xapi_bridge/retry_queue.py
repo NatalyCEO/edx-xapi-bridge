@@ -74,6 +74,29 @@ class RetryQueue:
                 if remaining_lines:
                     f.write('\n'.join(remaining_lines) + '\n')
         return ready
+    
+    def _save_to_sink(self, content_json: str) -> None:
+        """Сохраняет содержимое в файл результатов (sink file)."""
+        sink_file = getattr(settings, 'RETRY_SINK_FILE', None)
+        if not sink_file:
+            return
+        
+        sink_path = Path(sink_file)
+        sink_path.parent.mkdir(parents=True, exist_ok=True)
+        
+        with open(sink_path, 'a', encoding='utf-8') as f:
+            try:
+                parsed = json.loads(content_json)
+                if isinstance(parsed, list):
+                    for stmt in parsed:
+                        f.write(json.dumps(stmt, ensure_ascii=False) + '\n')
+                else:
+                    f.write(json.dumps(parsed, ensure_ascii=False) + '\n')
+            except Exception:
+                # если не удалось распарсить, пишем как есть одной строкой
+                f.write(content_json + '\n')
+        
+        logger.info(f"Сохранены ретрай-записи в {sink_file}")
 
 
 class RetryQueueWorker(threading.Thread):
@@ -168,16 +191,44 @@ class RetryQueueWorker(threading.Thread):
                 else:
                     from xapi_bridge import client  # type: ignore
                     payload = json.loads(content_json)
-                    response: LRSResponse = client.lrs_publisher.lrs.save_statements(payload)
-                    if not response.success:
-                        status = getattr(response.response, 'status', None)
-                        all_ok = False
-                        if client.lrs_publisher.backend.is_not_found(status, str(response.data)):
-                            self.queue.enqueue(content_json)
+                    try:
+                        response: LRSResponse = client.lrs_publisher.lrs.save_statements(payload)
+                        if not response.success:
+                            status = getattr(response.response, 'status', None)
+                            all_ok = False
+                            # 404 и повторяемые статусы — переочередяем
+                            if (
+                                client.lrs_publisher.backend.is_not_found(status, str(response.data))
+                                or status in {408, 429, 500, 502, 503, 504}
+                            ):
+                                # Учитываем Retry-After если доступно
+                                delay_seconds = None
+                                try:
+                                    getheader = getattr(response.response, 'getheader', None)
+                                    if callable(getheader):
+                                        ra = getheader('Retry-After')
+                                        if ra:
+                                            try:
+                                                delay_seconds = int(ra)
+                                            except Exception:
+                                                delay_seconds = None
+                                except Exception:
+                                    pass
+                                self.queue.enqueue(content_json, delay_seconds=delay_seconds)
+                            else:
+                                logger.error(f"Ошибка повторной отправки: {status} {response.data}")
                         else:
-                            logger.error(f"Ошибка повторной отправки: {status} {response.data}")
-                    else:
-                        logger.info("Успешная повторная отправка из очереди")
+                            logger.info("Успешная повторная отправка из очереди")
+                    except (ConnectionRefusedError, ConnectionResetError, BrokenPipeError, TimeoutError) as net_err:
+                        # transient сетевые ошибки — вернём обратно
+                        all_ok = False
+                        logger.warning(f"Сетевая ошибка при повторной отправке: {net_err}")
+                        self.queue.enqueue(content_json)
+                    except Exception as send_err:
+                        # Прочие ошибки сохраним в лог, не теряем запись
+                        all_ok = False
+                        logger.error(f"Ошибка при отправке из очереди: {send_err}")
+                        self.queue.enqueue(content_json)
             except Exception as e:
                 all_ok = False
                 logger.error(f"Ошибка при повторной отправке из очереди: {e}")

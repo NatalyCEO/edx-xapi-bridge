@@ -7,7 +7,15 @@ import importlib
 import json
 import logging
 import socket
+import ssl
 from typing import Any, Dict, Optional
+import http.client as http_client
+try:
+    import urllib3
+    from urllib3.exceptions import ProtocolError, ReadTimeoutError, ConnectTimeoutError, MaxRetryError
+except Exception:  # pragma: no cover - urllib3 может отсутствовать напрямую
+    urllib3 = None
+    ProtocolError = ReadTimeoutError = ConnectTimeoutError = MaxRetryError = type('Dummy', (), {})
 
 from tincan import RemoteLRS, StatementList
 from tincan.lrs_response import LRSResponse
@@ -113,12 +121,32 @@ class XAPIBridgeLRSPublisher:
         except exceptions.XAPIBridgeStatementError:
             # Пробрасываем дальше, чтобы верхний уровень мог удалить проблемное высказывание
             raise
-        except (socket.gaierror, ConnectionRefusedError) as e:
+        except (
+            socket.gaierror,
+            ConnectionRefusedError,
+            ConnectionResetError,
+            BrokenPipeError,
+            socket.timeout,
+            TimeoutError,
+            ssl.SSLError,
+            http_client.RemoteDisconnected,
+            ProtocolError,
+            ReadTimeoutError,
+            ConnectTimeoutError,
+            MaxRetryError,
+        ) as e:
+            # Сеть/имя хоста/таймаут — отправляем в отложенную очередь
             error_msg = f"Ошибка подключения к LRS: {str(e)}"
             logger.error(error_msg)
-            raise exceptions.XAPIBridgeLRSConnectionError(
-                endpoint=settings.LRS_ENDPOINT,
-                status_code=None
+            try:
+                content_json = json.dumps(statement_dicts, ensure_ascii=False)
+                self.retry_queue.enqueue(content_json)
+            except Exception:
+                logger.exception("Не удалось добавить высказывания в очередь отложенной отправки")
+            # Сигнализируем верхнему уровню, что пакет отложен
+            raise exceptions.XAPIBridgeDeferredRetry(
+                reason=type(e).__name__,
+                statements_count=len(statements)
             ) from e
         except Exception as e:
             error_msg = f"Неожиданная ошибка при отправке в LRS: {str(e)}"
@@ -198,6 +226,34 @@ class XAPIBridgeLRSPublisher:
             except Exception:
                 logger.exception("Не удалось добавить высказывания в очередь отложенной отправки")
             # В любом случае сигнализируем об отложенной отправке, чтобы верхний уровень не считал как успех
+            raise exceptions.XAPIBridgeDeferredRetry(
+                reason=f"HTTP {status_code}",
+                statements_count=len(statements)
+            )
+
+        # Повторяемые статусы: 408/429/5xx
+        retryable_statuses = {408, 429, 500, 502, 503, 504}
+        if status_code in retryable_statuses:
+            content = response.request.content
+            if isinstance(content, (bytes, bytearray)):
+                content = content.decode('utf-8', errors='ignore')
+            delay_seconds = None
+            # Учитываем Retry-After, если возможно получить
+            try:
+                getheader = getattr(response.response, 'getheader', None)
+                if callable(getheader):
+                    retry_after = getheader('Retry-After')
+                    if retry_after:
+                        try:
+                            delay_seconds = int(retry_after)
+                        except Exception:
+                            delay_seconds = None
+            except Exception:
+                pass
+            try:
+                self.retry_queue.enqueue(content, delay_seconds=delay_seconds)
+            except Exception:
+                logger.exception("Не удалось добавить высказывания в очередь отложенной отправки")
             raise exceptions.XAPIBridgeDeferredRetry(
                 reason=f"HTTP {status_code}",
                 statements_count=len(statements)

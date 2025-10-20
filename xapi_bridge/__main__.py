@@ -130,7 +130,31 @@ class QueueManager:
     def _handle_connection_error(self, e: exceptions.XAPIBridgeLRSConnectionError, statements: StatementList) -> None:
         """Обработка ошибок соединения."""
         if self.publish_retries >= settings.PUBLISH_MAX_RETRIES:
-            e.err_fail()
+            # Максимум попыток исчерпан — откладываем пакет в очередь ретраев
+            try:
+                statement_dicts = []
+                for stmt in statements:
+                    if hasattr(stmt, 'as_version'):
+                        statement_dicts.append(stmt.as_version('1.0.3'))
+                    elif hasattr(stmt, 'to_dict'):
+                        statement_dicts.append(stmt.to_dict())
+                    elif hasattr(stmt, '__dict__'):
+                        statement_dicts.append(stmt.__dict__)
+                    elif isinstance(stmt, dict):
+                        statement_dicts.append(stmt)
+                import json as _json
+                content_json = _json.dumps(statement_dicts, ensure_ascii=False)
+                client.lrs_publisher.retry_queue.enqueue(content_json)
+                logger.warning(
+                    f"Пакет из {len(statement_dicts)} высказываний перенесён в отложенную очередь после исчерпания попыток"
+                )
+            except Exception:
+                logger.exception("Не удалось добавить пакет в очередь отложенной отправки после исчерпания попыток")
+            # Сообщаем вызывающему коду, что отправка отложена
+            raise exceptions.XAPIBridgeDeferredRetry(
+                reason="max_retries_exhausted",
+                statements_count=len(statements)
+            )
         self.publish_retries += 1
         time.sleep(1)
 
